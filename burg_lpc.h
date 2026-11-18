@@ -9,7 +9,9 @@
 // stays stable.
 #include <vector>
 #include <cstddef>
+#include <cstdint>
 #include <cmath>
+#include <algorithm>
 
 namespace burg_lpc {
 
@@ -76,5 +78,67 @@ namespace burg_lpc {
             bs[0] = y;
             out[t] = y;
         }
+    }
+
+    //--------------------------------------------------------------------
+    // Edge extrapolation for a resampler: extends audio before its start or after its end so the first and last
+    // blocks see a continuation of the signal instead of a step from silence.  Shared by Ardftsrc.cpp and dBpoweramp.
+
+    struct EdgeParams {
+        size_t analysis;    // frames next to the edge the predictor is fitted to (~0.19 s)
+        size_t order;       // predictor order (256 at 44.1 / 48 kHz)
+        size_t predict;     // frames predicted (0.5 s); beyond this the extension is zero
+    };
+
+    inline EdgeParams edge_params(int sampleRate)
+    {
+        const double scale = sampleRate / 44100.0;
+        EdgeParams p;
+        p.analysis = static_cast<size_t>(std::clamp<long long>(std::llround(8192 * scale), 1024, 65536));
+        p.order = static_cast<size_t>(std::clamp<long long>(std::llround(256 * scale), 32, 1024));
+        p.predict = static_cast<size_t>((std::max)(sampleRate / 2, 1));
+        return p;
+    }
+
+    // in: interleaved audio, 'frames' x 'channels', of which the analysis length nearest the edge is used
+    //     (the first frames for pre = true, the last frames for pre = false).
+    // Returns 'len' interleaved frames: for pre the last frame immediately precedes in[0], for post the first frame
+    // immediately follows the last frame of in.  The prediction is faded to zero with a half-Hann window over
+    // min(len, predict) frames (1 at the boundary) and is zero beyond; a channel whose prediction exceeds 4x the
+    // peak of its analysed audio (or is not finite) is left at zero.
+    inline std::vector<double> extrapolate_edge(const double* in, size_t frames, size_t channels, size_t len,
+                                                bool pre, int sampleRate)
+    {
+        std::vector<double> ext(len * channels, 0.0);
+        if (frames == 0 || channels == 0 || len == 0)
+            return ext;
+
+        const EdgeParams params = edge_params(sampleRate);
+        const size_t n = (std::min)(frames, params.analysis);
+        const size_t predictLen = (std::min)(len, params.predict);
+        const double pi = 3.14159265358979323846;
+
+        std::vector<double> ana(n), pred(predictLen);
+        for (size_t c = 0; c < channels; ++c) {
+            // analysis data in time order ending next to the gap: reversed for the start
+            for (size_t i = 0; i < n; ++i)
+                ana[i] = pre ? in[(n - 1 - i) * channels + c] : in[(frames - n + i) * channels + c];
+
+            const std::vector<double> k = reflection_coefficients(ana.data(), n, params.order);
+            extrapolate(k, ana.data(), n, pred.data(), predictLen);
+
+            double peakIn = 0, peakOut = 0;
+            for (double v : ana) peakIn = (std::max)(peakIn, std::abs(v));
+            for (double v : pred) peakOut = (std::max)(peakOut, std::abs(v));
+            if (!(peakOut <= 4.0 * peakIn))
+                continue;
+
+            for (size_t d = 0; d < predictLen; ++d) {       // d = distance from the boundary
+                const double w = 0.5 * (1.0 + std::cos(pi * (static_cast<double>(d) + 0.5) / static_cast<double>(predictLen)));
+                const size_t pos = pre ? len - 1 - d : d;
+                ext[pos * channels + c] = pred[d] * w;
+            }
+        }
+        return ext;
     }
 }

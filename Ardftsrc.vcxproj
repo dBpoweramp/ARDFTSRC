@@ -146,7 +146,6 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Ardftsrc.cpp" />
-    <ClCompile Include="vorbis_lpc.cpp" />
     <ClCompile Include="CFFT-fftw3.cpp">
       <!-- optional FFTW backend for CARDFTSRC<CFFT_fftw3>; not used by Ardftsrc.cpp -->
       <ExcludedFromBuild>true</ExcludedFromBuild>
@@ -157,7 +156,6 @@
     <ClInclude Include="CARDFTSRC.h" />
     <ClInclude Include="FFT-pocketfft.h" />
     <ClInclude Include="pocketfft_hdronly.h" />
-    <ClInclude Include="vorbis_lpc.h" />
     <ClInclude Include="burg_lpc.h" />
     <ClInclude Include="CFFT-fftw3.h" />
   </ItemGroup>

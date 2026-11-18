@@ -25,7 +25,6 @@
 #include <boost/multiprecision/cpp_double_fp.hpp>   // Boost >= 1.89 (header only)
 #include "AudioFile.h"                              // WAV / AIFF I/O (modified copy in this tree: adds 64-bit float)
 #include "CARDFTSRC.h"
-#include "vorbis_lpc.h"
 #include "burg_lpc.h"
 
 // "F128" precision: a double-double, i.e. an unevaluated sum of two doubles (106-bit significand, ~32 digits).
@@ -114,67 +113,32 @@ static void PrintUsage() {
         "\nOptions:\n"
         "  --f128         double-double precision (same as the _f128 suffix)\n"
         "  --no-lpc       zero-pad the start and end of the file instead of LPC extrapolation\n"
-        "  --vorbis-lpc   previous edge extrapolation (vorbis_lpc, order 32) instead of Burg\n"
         "\nExamples:  ardftsrc \"c:\\in.wav\" \"c:\\out.wav\" 48000 24 high\n"
         "           ardftsrc \"c:\\in.wav\" \"c:\\out.wav\" 44100 24 \"max bandwidth, min phase_f128\"\n"
         "           ardftsrc \"c:\\in.wav\" \"c:\\out.wav\" 48000 24 8192 0.99      (numeric quality / bandwidth)\n";
 }
 
 //--------------------------------------------------------------------
-enum class EdgeMode { Burg, Vorbis, Zero };
-
-// Builds 'len' samples per channel (interleaved) of extrapolation before the start (pre) or after the end (post) of
-// the file, so the first and last blocks see a continuation of the signal instead of a step from silence.
-//
-// Burg (default): an order ~256 predictor (scaled with the sample rate) from the ~0.19 s of audio next to the edge,
-// run as a lattice filter for up to 0.5 s and faded out with a half-Hann window (1 at the file boundary).
-// Measured against resampling the uncut signal, the error in the first/last 100 ms of output drops by ~10-15 dB on
-// music and to the numerical floor on steady tones, compared with the vorbis_lpc method.
-// Vorbis: the previous method - vorbis_lpc order 32, analysis and prediction over the whole edge, faded over it.
-// Either way a channel whose prediction exceeds 4x the peak of the analysed audio is left at zero.
+// Builds 'len' samples per channel (interleaved) of Burg LPC extrapolation before the start (pre) or after the end
+// (post) of the file, so the first and last blocks see a continuation of the signal instead of a step from silence.
+// See burg_lpc::extrapolate_edge: a predictor of order ~256 (scaled with the sample rate) fitted to the ~0.19 s next
+// to the edge, run for up to 0.5 s and faded out.  Measured against resampling the uncut signal, the error in the
+// first/last 100 ms of output is typically 10-15 dB lower on music than with the earlier vorbis_lpc order-32 method.
 static std::vector<double> EdgeExtrapolation(const AudioFile<double>::AudioBuffer& samples, int64_t numSamples,
-                                             int64_t len, bool pre, int sampleRate, EdgeMode method) {
+                                             int64_t len, bool pre, int sampleRate) {
     const size_t nch = samples.size();
-    std::vector<double> ext(static_cast<size_t>(len) * nch, 0.0);
-    if (method == EdgeMode::Zero || numSamples <= 0 || nch == 0 || len <= 0)
-        return ext;
+    if (numSamples <= 0 || nch == 0 || len <= 0)
+        return std::vector<double>(static_cast<size_t>(std::max<int64_t>(len, 0)) * nch, 0.0);
 
-    const double pi = 3.14159265358979323846;
-    const double rateScale = sampleRate / 44100.0;
-    const int64_t analysisLen = method == EdgeMode::Burg
-        ? std::min(numSamples, std::clamp<int64_t>(std::llround(8192 * rateScale), 1024, 65536))
-        : std::min(len, numSamples);
-    const int64_t predictLen = method == EdgeMode::Burg ? std::min<int64_t>(len, std::max(sampleRate / 2, 1)) : analysisLen;
-    const int64_t fadeLen = method == EdgeMode::Burg ? predictLen : len;
-    const size_t order = static_cast<size_t>(std::clamp<int64_t>(std::llround(256 * rateScale), 32, 1024));
+    // interleaved copy of the frames next to the edge (only those are analysed)
+    const int64_t n = std::min<int64_t>(numSamples, static_cast<int64_t>(burg_lpc::edge_params(sampleRate).analysis));
+    const int64_t first = pre ? 0 : numSamples - n;
+    std::vector<double> excerpt(static_cast<size_t>(n) * nch);
+    for (int64_t i = 0; i < n; ++i)
+        for (size_t c = 0; c < nch; ++c)
+            excerpt[static_cast<size_t>(i) * nch + c] = samples[c][static_cast<size_t>(first + i)];
 
-    // Analysis data in time order, ending next to the gap: reversed for the start of the file.
-    std::vector<double> ana(static_cast<size_t>(analysisLen)), pred(static_cast<size_t>(predictLen));
-    for (size_t c = 0; c < nch; ++c) {
-        for (int64_t i = 0; i < analysisLen; ++i)
-            ana[static_cast<size_t>(i)] = pre ? samples[c][static_cast<size_t>(analysisLen - 1 - i)]
-                                              : samples[c][static_cast<size_t>(numSamples - analysisLen + i)];
-
-        if (method == EdgeMode::Burg) {
-            const auto k = burg_lpc::reflection_coefficients(ana.data(), ana.size(), order);
-            burg_lpc::extrapolate(k, ana.data(), ana.size(), pred.data(), pred.size());
-        }
-        else    // vorbis_lpc::postextrapolate_chunk continues its input, which is already ordered towards the gap
-            vorbis_lpc::postextrapolate_chunk(pred.data(), ana.data(), ana.size(), 1);
-
-        double peakIn = 0, peakOut = 0;
-        for (double v : ana) peakIn = std::max(peakIn, std::abs(v));
-        for (double v : pred) peakOut = std::max(peakOut, std::abs(v));
-        if (!(peakOut <= 4.0 * peakIn))                 // unstable prediction (or NaN): leave this channel zero
-            continue;
-
-        for (int64_t d = 0; d < predictLen; ++d) {      // d = distance from the file boundary
-            const double w = 0.5 * (1.0 + std::cos(pi * (static_cast<double>(d) + 0.5) / static_cast<double>(fadeLen)));
-            const int64_t pos = pre ? len - 1 - d : d;
-            ext[static_cast<size_t>(pos) * nch + c] = pred[static_cast<size_t>(d)] * w;
-        }
-    }
-    return ext;
+    return burg_lpc::extrapolate_edge(excerpt.data(), static_cast<size_t>(n), nch, static_cast<size_t>(len), pre, sampleRate);
 }
 
 //--------------------------------------------------------------------
@@ -183,7 +147,7 @@ static std::vector<double> EdgeExtrapolation(const AudioFile<double>::AudioBuffe
 // (FirstBlocksSampleDelay()) plus the resampled lead-in is dropped, so the output is aligned with the input and
 // exactly round(numSamples * outRate / inRate) samples long.
 template<typename scalar_t>
-static bool Resample(const AudioFile<double>& in, int outRate, const STArdMode& mode, EdgeMode edgeMode,
+static bool Resample(const AudioFile<double>& in, int outRate, const STArdMode& mode, bool useLpc,
                      AudioFile<double>::AudioBuffer& out) {
     const int inRate = static_cast<int>(in.getSampleRate());
     const int nch = in.getNumChannels();
@@ -202,8 +166,9 @@ static bool Resample(const AudioFile<double>& in, int outRate, const STArdMode& 
     std::cout << "Block size: " << inChunk << " in / " << outChunk << " out samples   FFT: "
               << 2 * inChunk << " / " << 2 * outChunk << "\n\n";
 
-    const std::vector<double> head = EdgeExtrapolation(in.samples, numIn, edge, true, inRate, edgeMode);
-    const std::vector<double> tail = EdgeExtrapolation(in.samples, numIn, edge, false, inRate, edgeMode);
+    const std::vector<double> zeros = useLpc ? std::vector<double>() : std::vector<double>(static_cast<size_t>(edge) * nch, 0.0);
+    const std::vector<double> head = useLpc ? EdgeExtrapolation(in.samples, numIn, edge, true, inRate) : zeros;
+    const std::vector<double> tail = useLpc ? EdgeExtrapolation(in.samples, numIn, edge, false, inRate) : zeros;
 
     // Stream sample s (per channel): [0, edge) head, [edge, edge + numIn) audio, then tail, then zeros.
     auto streamSample = [&](int64_t s, int c) -> double {
@@ -254,14 +219,12 @@ int main(int argc, char* argv[])
     }
 
     // Remaining arguments: options, then either a mode name or numeric quality [bandwidth].
-    bool forceF128 = false;
-    EdgeMode edgeMode = EdgeMode::Burg;
+    bool forceF128 = false, useLpc = true;
     std::vector<std::string> rest;
     for (int i = 5; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--f128") forceF128 = true;
-        else if (a == "--no-lpc") edgeMode = EdgeMode::Zero;
-        else if (a == "--vorbis-lpc") edgeMode = EdgeMode::Vorbis;
+        else if (a == "--no-lpc") useLpc = false;
         else rest.push_back(a);
     }
 
@@ -328,15 +291,15 @@ int main(int argc, char* argv[])
     else if (mode.Betacdftaper > 0) std::cout << "beta-CDF, order " << mode.Betacdftaper;
     else std::cout << "rational cosine";
     std::cout << "\n            Precision: " << (mode.useF128 ? "double-double (boost cpp_double_double)" : "double")
-              << "   Edges: " << (edgeMode == EdgeMode::Burg ? "Burg LPC extrapolation" : edgeMode == EdgeMode::Vorbis ? "vorbis LPC extrapolation" : "zero padding") << "\n";
+              << "   Edges: " << (useLpc ? "Burg LPC extrapolation" : "zero padding") << "\n";
 
     // ######################################
 
     const auto t0 = std::chrono::steady_clock::now();
     AudioFile<double>::AudioBuffer outBuffer;
     const bool ok = mode.useF128
-        ? Resample<f128_t>(inputAudioFile, (int)output_samplerate, mode, edgeMode, outBuffer)
-        : Resample<double>(inputAudioFile, (int)output_samplerate, mode, edgeMode, outBuffer);
+        ? Resample<f128_t>(inputAudioFile, (int)output_samplerate, mode, useLpc, outBuffer)
+        : Resample<double>(inputAudioFile, (int)output_samplerate, mode, useLpc, outBuffer);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     if (!ok) {

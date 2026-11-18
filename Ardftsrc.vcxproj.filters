@@ -18,9 +18,6 @@
     <ClCompile Include="Ardftsrc.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="vorbis_lpc.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="CFFT-fftw3.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -36,9 +33,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="pocketfft_hdronly.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="vorbis_lpc.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="burg_lpc.h">
