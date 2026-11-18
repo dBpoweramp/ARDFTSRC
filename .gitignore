@@ -1,0 +1,20 @@
+*.tmp
+*.sdf
+*.ipch
+*.opensdf
+*.tlog
+**/Debug/
+**/Release/
+**/x64/
+**/Release MinDependency/
+**/ReleaseMinDependency/
+**/boost/
+*.db
+*.opendb
+.vs
+*.idb
+*.user
+*.aps
+.vscode/
+*.dmg
+*.exe
