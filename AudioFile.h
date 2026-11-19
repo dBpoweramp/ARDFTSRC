@@ -34,7 +34,9 @@
 //    files were read as 32-bit integer PCM)
 //  - WAV/AIFF chunk sizes and sample offsets are unsigned 32-bit / size_t, so files between 2 and 4 GB load
 //    and save (a larger WAV is refused with an error instead of writing a corrupt header)
-//  - RIFF/IFF chunks of odd size are followed by their pad byte when searching for chunks
+//  - RIFF/IFF chunks of odd size are followed by their pad byte when searching for chunks (files whose writer
+//    left the pad byte out are still read)
+//  - the iXML chunk is read with a bounds check, and with the right byte order in AIFF files
 //  - float WAV files are written with the 'fact' chunk that non-PCM formats should carry
 //=======================================================================
 
@@ -223,7 +225,7 @@ private:
     static inline int64_t getIndexOfChunk (const std::vector<uint8_t>& source, const std::string& chunkHeaderID, size_t startIndex, Endianness endianness = Endianness::LittleEndian);
 
     //=============================================================
-    static inline uint32_t getAiffSampleRate (const std::vector<uint8_t>& fileData, int sampleRateStartIndex);
+    static inline uint32_t getAiffSampleRate (const std::vector<uint8_t>& fileData, size_t sampleRateStartIndex);    // ARDFTSRC: size_t
     static inline void addSampleRateToAiffData (std::vector<uint8_t>& fileData, uint32_t sampleRate);
     
     //=============================================================
@@ -723,10 +725,12 @@ bool AudioFile<T>::decodeWaveFile (const std::vector<uint8_t>& fileData)
 
     // -----------------------------------------------------------
     // iXML CHUNK
-    if (indexOfXMLChunk != -1)
+    if (indexOfXMLChunk != -1 && static_cast<size_t> (indexOfXMLChunk) + 8 <= fileData.size())
     {
-        uint32_t chunkSize = static_cast<uint32_t> (fourBytesToInt (fileData, static_cast<size_t> (indexOfXMLChunk) + 4));
-        iXMLChunk = std::string (reinterpret_cast<const char*> (&fileData[static_cast<size_t> (indexOfXMLChunk) + 8]), chunkSize);
+        // ARDFTSRC: the size is limited to what the file holds
+        const size_t x = static_cast<size_t> (indexOfXMLChunk);
+        const size_t chunkSize = std::min (static_cast<size_t> (static_cast<uint32_t> (fourBytesToInt (fileData, x + 4))), fileData.size() - x - 8);
+        iXMLChunk = std::string (reinterpret_cast<const char*> (fileData.data() + x + 8), chunkSize);
     }
 
     return true;
@@ -895,10 +899,13 @@ bool AudioFile<T>::decodeAiffFile (const std::vector<uint8_t>& fileData)
 
     // -----------------------------------------------------------
     // iXML CHUNK
-    if (indexOfXMLChunk != -1)
+    if (indexOfXMLChunk != -1 && static_cast<size_t> (indexOfXMLChunk) + 8 <= fileData.size())
     {
-        uint32_t chunkSize = static_cast<uint32_t> (fourBytesToInt (fileData, static_cast<size_t> (indexOfXMLChunk) + 4));
-        iXMLChunk = std::string (reinterpret_cast<const char*> (&fileData[static_cast<size_t> (indexOfXMLChunk) + 8]), chunkSize);
+        // ARDFTSRC: AIFF chunk sizes are big-endian (this one was read little-endian), and the size is limited to
+        // what the file holds
+        const size_t x = static_cast<size_t> (indexOfXMLChunk);
+        const size_t chunkSize = std::min (static_cast<size_t> (static_cast<uint32_t> (fourBytesToInt (fileData, x + 4, Endianness::BigEndian))), fileData.size() - x - 8);
+        iXMLChunk = std::string (reinterpret_cast<const char*> (fileData.data() + x + 8), chunkSize);
     }
     
     return true;
@@ -906,7 +913,7 @@ bool AudioFile<T>::decodeAiffFile (const std::vector<uint8_t>& fileData)
 
 //=============================================================
 template <class T>
-uint32_t AudioFile<T>::getAiffSampleRate (const std::vector<uint8_t>& fileData, int sampleRateStartIndex)
+uint32_t AudioFile<T>::getAiffSampleRate (const std::vector<uint8_t>& fileData, size_t sampleRateStartIndex)
 {
     double sampleRate = AiffUtilities::decodeAiffSampleRate (&fileData[sampleRateStartIndex]);
     return static_cast<uint32_t> (sampleRate);
@@ -1358,6 +1365,16 @@ int64_t AudioFile<T>::getIndexOfChunk (const std::vector<uint8_t>& source, const
     }
 
     // ARDFTSRC: size_t position and unsigned chunk size (chunks over 2 GB), and the pad byte after odd-sized chunks
+    auto looksLikeChunkID = [&source] (size_t pos)
+    {
+        if (pos + 4 > source.size())
+            return false;
+        for (size_t k = 0; k < 4; k++)
+            if (source[pos + k] < 0x20 || source[pos + k] > 0x7E)
+                return false;
+        return true;
+    };
+
     size_t i = startIndex;
     while (i + dataLen < source.size())
     {
@@ -1379,7 +1396,12 @@ int64_t AudioFile<T>::getIndexOfChunk (const std::vector<uint8_t>& source, const
             assert (false && "Invalid chunk size");
             return -1;
         }
-        i += (dataLen + chunkSize + (chunkSize & 1));
+        i += (dataLen + chunkSize);
+        
+        // A chunk of odd size is followed by a pad byte.  Some writers leave it out, so the pad is skipped unless
+        // only the unpadded position looks like the start of a chunk.
+        if ((chunkSize & 1) && (looksLikeChunkID (i + 1) || ! looksLikeChunkID (i)))
+            i++;
     }
 
     return -1;

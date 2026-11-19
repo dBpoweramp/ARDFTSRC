@@ -121,7 +121,7 @@ static void PrintUsage() {
 //--------------------------------------------------------------------
 // Builds 'len' samples per channel (interleaved) of Burg LPC extrapolation before the start (pre) or after the end
 // (post) of the file, so the first and last blocks see a continuation of the signal instead of a step from silence.
-// See burg_lpc::extrapolate_edge: a predictor of order ~256 (scaled with the sample rate) fitted to the ~0.19 s next
+// See burg_lpc::extrapolate_edge: a predictor of order ~256 (scaled with the sample rate) fitted to the ~46 ms next
 // to the edge, run for up to 0.5 s and faded out.  Measured against resampling the uncut signal, the error in the
 // first/last 100 ms of output is typically 10-15 dB lower on music than with the earlier vorbis_lpc order-32 method.
 static std::vector<double> EdgeExtrapolation(const AudioFile<double>::AudioBuffer& samples, int64_t numSamples,
@@ -183,7 +183,7 @@ static bool Resample(const AudioFile<double>& in, int outRate, const STArdMode& 
     out.assign(nch, std::vector<double>(static_cast<size_t>(numOut), 0.0));
 
     for (int64_t chunk = 0; chunk < numChunks; ++chunk) {
-        std::cout << "Resampling " << std::fixed << std::setprecision(2) << (100.0 * chunk / numChunks) << " %\r" << std::flush;
+        std::cout << "Resampling " << std::fixed << std::setprecision(2) << (100.0 * static_cast<double>(chunk) / static_cast<double>(numChunks)) << " %\r" << std::flush;
         const int64_t inBase = chunk * inChunk;
         const int64_t outBase = chunk * outChunk - skip;
         src.process_ex(

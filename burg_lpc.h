@@ -85,16 +85,20 @@ namespace burg_lpc {
     // blocks see a continuation of the signal instead of a step from silence.  Shared by Ardftsrc.cpp and dBpoweramp.
 
     struct EdgeParams {
-        size_t analysis;    // frames next to the edge the predictor is fitted to (~0.19 s)
+        size_t analysis;    // frames next to the edge the predictor is fitted to (~46 ms: 2048 at 44.1 kHz)
         size_t order;       // predictor order (256 at 44.1 / 48 kHz)
         size_t predict;     // frames predicted (0.5 s); beyond this the extension is zero
     };
+
+    // The analysis length was chosen by cutting segments out of music and comparing the resampled edges with those
+    // of the uncut recording: 1024-4096 frames at 44.1 kHz all do about equally well and a little better than
+    // 8192 or more (the predictor should describe the sound right at the edge, not the last fifth of a second).
 
     inline EdgeParams edge_params(int sampleRate)
     {
         const double scale = sampleRate / 44100.0;
         EdgeParams p;
-        p.analysis = static_cast<size_t>(std::clamp<long long>(std::llround(8192 * scale), 1024, 65536));
+        p.analysis = static_cast<size_t>(std::clamp<long long>(std::llround(2048 * scale), 256, 16384));
         p.order = static_cast<size_t>(std::clamp<long long>(std::llround(256 * scale), 32, 1024));
         p.predict = static_cast<size_t>((std::max)(sampleRate / 2, 1));
         return p;

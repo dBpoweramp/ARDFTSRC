@@ -45,6 +45,18 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #ifndef POCKETFFT_HDRONLY_H
 #define POCKETFFT_HDRONLY_H
 
+// ---- ARDFTSRC patch -----------------------------------------------------------------------------------------
+// This copy of pocketfft is modified; every change is marked "ARDFTSRC patch".
+// For double it computes the twiddle factors in double-double arithmetic (see ddreal below).  That arithmetic
+// needs every operation rounded to double as written, so with fast-math or x87 extended-precision evaluation -
+// or when ARDFTSRC_FFT_DOUBLE_TWIDDLES is defined - ddreal works in plain double instead, which gives exactly
+// the stock twiddle factors.  The types are the same either way; only the arithmetic differs.
+#if defined(ARDFTSRC_FFT_DOUBLE_TWIDDLES) || defined(__FAST_MATH__) || defined(_M_FP_FAST) || \
+    (defined(__FLT_EVAL_METHOD__) && __FLT_EVAL_METHOD__ != 0) || (defined(_M_IX86_FP) && _M_IX86_FP == 0)
+#define POCKETFFT_DDREAL_PLAIN
+#endif
+// ---- end ARDFTSRC patch -------------------------------------------------------------------------------------
+
 #ifndef __cplusplus
 #error This file is C++ and requires a C++ compiler.
 #endif
@@ -69,6 +81,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <algorithm>
 #include <limits>
 #include <type_traits>  // ARDFTSRC patch
+#include <new>          // ARDFTSRC patch
 #if POCKETFFT_CACHE_SIZE!=0
 #include <array>
 #include <mutex>
@@ -220,25 +233,39 @@ template<typename T> class arr
     T *p;
     size_t sz;
 
+    // ARDFTSRC patch: the memory comes from malloc, so elements of class type (boost cpp_double_double, cmplx<>)
+    // are default-constructed in it and destroyed again; nothing happens for float / double.
+    static T *construct(T *ptr, size_t num)
+      {
+      if (!std::is_trivially_default_constructible<T>::value)
+        for (size_t i=0; i<num; ++i) ::new (static_cast<void *>(ptr+i)) T;
+      return ptr;
+      }
+    static void destroy(T *ptr, size_t num)
+      {
+      if (!std::is_trivially_destructible<T>::value)
+        for (size_t i=0; i<num; ++i) ptr[i].~T();
+      }
+
 #if defined(POCKETFFT_NO_VECTORS)
     static T *ralloc(size_t num)
       {
       if (num==0) return nullptr;
       void *res = malloc(num*sizeof(T));
       if (!res) throw std::bad_alloc();
-      return reinterpret_cast<T *>(res);
+      return construct(reinterpret_cast<T *>(res), num);
       }
-    static void dealloc(T *ptr)
-      { free(ptr); }
+    static void dealloc(T *ptr, size_t num)
+      { destroy(ptr, num); free(ptr); }
 #else
     static T *ralloc(size_t num)
       {
       if (num==0) return nullptr;
       void *ptr = aligned_alloc(64, num*sizeof(T));
-      return static_cast<T*>(ptr);
+      return construct(static_cast<T*>(ptr), num);
       }
-    static void dealloc(T *ptr)
-      { aligned_dealloc(ptr); }
+    static void dealloc(T *ptr, size_t num)
+      { destroy(ptr, num); aligned_dealloc(ptr); }
 #endif
 
   public:
@@ -247,12 +274,12 @@ template<typename T> class arr
     arr(arr &&other)
       : p(other.p), sz(other.sz)
       { other.p=nullptr; other.sz=0; }
-    ~arr() { dealloc(p); }
+    ~arr() { dealloc(p, sz); }
 
     void resize(size_t n)
       {
       if (n==sz) return;
-      dealloc(p);
+      dealloc(p, sz);
       p = ralloc(n);
       sz = n;
       }
@@ -329,10 +356,147 @@ template<bool fwd, typename T> void ROTX90(cmplx<T> &a)
 //
 // twiddle factor section
 //
+// ---- ARDFTSRC patch -----------------------------------------------------------------------------------------
+// Twiddle factors for double.  Stock pocketfft computes them in double as the product of two table entries,
+// which leaves about 40 % of them 1-2 units in the last place off.  Here the tables and the product are
+// computed in double-double ("ddreal": an unevaluated sum hi + lo of two doubles, ~32 digits) and rounded to
+// double once, so every twiddle factor is correctly rounded.  Only plan construction is affected.
+// The arithmetic below is the classic Dekker / Knuth error-free transformations; it needs no FMA instruction.
+// In plain mode (POCKETFFT_DDREAL_PLAIN, see the top of this file) lo stays zero and the stock expressions
+// are used.
+struct ddreal
+  {
+  double hi, lo;
+  ddreal() = default;
+  explicit ddreal(double h, double l=0) : hi(h), lo(l) {}
+  // from an integer (the table index, below 2^53, so the conversion is exact)
+  template<typename I, typename = typename std::enable_if<std::is_integral<I>::value>::type>
+    explicit ddreal(I v) : hi(static_cast<double>(v)), lo(0) {}
+  };
+
+namespace ddmath {
+inline void two_sum(double a, double b, double &s, double &e)      // a+b == s+e exactly
+  { s = a+b; const double bb = s-a; e = (a-(s-bb)) + (b-bb); }
+inline void quick_two_sum(double a, double b, double &s, double &e) // same, needs |a|>=|b|
+  { s = a+b; e = b-(s-a); }
+inline void two_prod(double a, double b, double &p, double &e)     // a*b == p+e exactly
+  {
+  // The three rounded products go through volatile, so that a compiler allowed to contract (-mfma with
+  // -ffp-contract=fast, /fp:contract, /arch:AVX2 on older MSVC) cannot fuse them into a later addition, which
+  // would use the unrounded product there and silently break the transformation.  The four partial products
+  // below are exact in double, so fusing those changes nothing.
+  volatile double vp = a*b, va = 134217729.0*a, vb = 134217729.0*b;   // 2^27+1: Veltkamp split
+  p = vp;
+  double t = va; const double ah = t-(t-a), al = a-ah;
+  t = vb; const double bh = t-(t-b), bl = b-bh;
+  e = ((ah*bh-p) + ah*bl + al*bh) + al*bl;
+  }
+inline ddreal add(const ddreal &a, const ddreal &b)
+  {
+  double s1, s2, t1, t2;
+  two_sum(a.hi, b.hi, s1, s2);
+  two_sum(a.lo, b.lo, t1, t2);
+  s2 += t1; quick_two_sum(s1, s2, s1, s2);
+  s2 += t2; quick_two_sum(s1, s2, s1, s2);
+  return ddreal(s1, s2);
+  }
+inline ddreal mul(const ddreal &a, const ddreal &b)
+  {
+  double p, e;
+  two_prod(a.hi, b.hi, p, e);
+  e += a.hi*b.lo + a.lo*b.hi;
+  quick_two_sum(p, e, p, e);
+  return ddreal(p, e);
+  }
+inline ddreal div(const ddreal &a, double b)                        // a/b, b an exactly representable integer here
+  {
+  const double q1 = a.hi/b;
+  double p, e, s, t;
+  two_prod(q1, b, p, e);
+  two_sum(a.hi, -p, s, t);
+  t += a.lo; t -= e;
+  const double q2 = (s+t)/b;
+  quick_two_sum(q1, q2, s, t);
+  return ddreal(s, t);
+  }
+// sin and cos of |x| <= pi/4 by their Taylor series, to ~1e-32
+inline void sincos(const ddreal &x, ddreal &s, ddreal &c)
+  {
+  const ddreal x2 = mul(x, x);
+  ddreal term = x;                 // x^(2k+1)/(2k+1)!
+  s = x;
+  for (int k=1; k<24; ++k)
+    {
+    term = div(mul(term, x2), double((2*k)*(2*k+1)));
+    s = (k&1) ? add(s, ddreal(-term.hi, -term.lo)) : add(s, term);
+    if (std::abs(term.hi) < 1e-36) break;
+    }
+  term = ddreal(1.);               // x^(2k)/(2k)!
+  c = ddreal(1.);
+  for (int k=1; k<24; ++k)
+    {
+    term = div(mul(term, x2), double((2*k-1)*(2*k)));
+    c = (k&1) ? add(c, ddreal(-term.hi, -term.lo)) : add(c, term);
+    if (std::abs(term.hi) < 1e-36) break;
+    }
+  }
+} // namespace ddmath
+
+// what sincos_2pibyn asks of its high-precision type (found by argument-dependent lookup)
+inline ddreal operator-(const ddreal &a) { return ddreal(-a.hi, -a.lo); }
+#ifndef POCKETFFT_DDREAL_PLAIN
+inline ddreal operator*(const ddreal &a, const ddreal &b) { return ddmath::mul(a, b); }
+inline ddreal sin(const ddreal &x) { ddreal s, c; ddmath::sincos(x, s, c); return s; }
+inline ddreal cos(const ddreal &x) { ddreal s, c; ddmath::sincos(x, s, c); return c; }
+// pi/4 = 0.78539816339744830961566084581987572... as a double-double
+template<> inline ddreal twiddle_angle<ddreal>(size_t n)
+  { return ddmath::div(ddreal(0.78539816339744827900, 3.0616169978683830179e-17), double(n)); }
+#else
+inline ddreal operator*(const ddreal &a, const ddreal &b) { return ddreal(a.hi*b.hi); }
+inline ddreal sin(const ddreal &x) { return ddreal(std::sin(x.hi)); }
+inline ddreal cos(const ddreal &x) { return ddreal(std::cos(x.hi)); }
+template<> inline ddreal twiddle_angle<ddreal>(size_t n)
+  { return ddreal(twiddle_angle<double>(n)); }
+#endif
+
+// The type the twiddle factors are computed in before rounding to T.
+template<typename T> struct twiddle_type
+  { using type = typename std::conditional<(sizeof(T)>sizeof(double)), T, double>::type; };
+template<> struct twiddle_type<double> { using type = ddreal; };
+
+// x1*x2 rounded to T, for the two table entries each twiddle factor is the product of.
+template<typename T, typename Thigh> struct twiddle_product   // the stock expression
+  {
+  static cmplx<T> mul(const cmplx<Thigh> &x1, const cmplx<Thigh> &x2)
+    { return cmplx<T>(T(x1.r*x2.r-x1.i*x2.i), T(x1.r*x2.i+x1.i*x2.r)); }
+  };
+template<> struct twiddle_product<double, ddreal>             // double-double, rounded to double at the end
+  {
+  // a*b - c*d (the lo*lo terms are below 2^-104 and dropped)
+  static double dot_sub(const ddreal &a, const ddreal &b, const ddreal &c, const ddreal &d)
+    {
+    double p1, e1, p2, e2, s, t;
+    ddmath::two_prod(a.hi, b.hi, p1, e1);
+    ddmath::two_prod(c.hi, d.hi, p2, e2);
+    ddmath::two_sum(p1, -p2, s, t);
+    return s + (t + (e1-e2) + ((a.hi*b.lo + a.lo*b.hi) - (c.hi*d.lo + c.lo*d.hi)));
+    }
+  static cmplx<double> mul(const cmplx<ddreal> &x1, const cmplx<ddreal> &x2)
+    {
+#ifndef POCKETFFT_DDREAL_PLAIN
+    return cmplx<double>(dot_sub(x1.r, x2.r, x1.i, x2.i),      // r1*r2 - i1*i2
+                         dot_sub(x1.r, x2.i, -x1.i, x2.r));    // r1*i2 + i1*r2
+#else
+    return cmplx<double>(x1.r.hi*x2.r.hi-x1.i.hi*x2.i.hi, x1.r.hi*x2.i.hi+x1.i.hi*x2.r.hi);
+#endif
+    }
+  };
+// ---- end ARDFTSRC patch -------------------------------------------------------------------------------------
+
 template<typename T> class sincos_2pibyn
   {
   private:
-    using Thigh = typename std::conditional<(sizeof(T)>sizeof(double)), T, double>::type;
+    using Thigh = typename twiddle_type<T>::type;
     size_t N, mask, shift;
     arr<cmplx<Thigh>> v1, v2;
 
@@ -393,13 +557,10 @@ template<typename T> class sincos_2pibyn
     cmplx<T> operator[](size_t idx) const
       {
       if (2*idx<=N)
-        {
-        auto x1=v1[idx&mask], x2=v2[idx>>shift];
-        return cmplx<T>(T(x1.r*x2.r-x1.i*x2.i), T(x1.r*x2.i+x1.i*x2.r));
-        }
+        return twiddle_product<T, Thigh>::mul(v1[idx&mask], v2[idx>>shift]);   // ARDFTSRC patch
       idx = N-idx;
-      auto x1=v1[idx&mask], x2=v2[idx>>shift];
-      return cmplx<T>(T(x1.r*x2.r-x1.i*x2.i), -T(x1.r*x2.i+x1.i*x2.r));
+      const cmplx<T> t = twiddle_product<T, Thigh>::mul(v1[idx&mask], v2[idx>>shift]);
+      return cmplx<T>(t.r, -t.i);
       }
   };
 
@@ -3766,5 +3927,7 @@ using detail::dst;
 
 #undef POCKETFFT_NOINLINE
 #undef POCKETFFT_RESTRICT
+#undef POCKETFFT_FPCONST
+#undef POCKETFFT_DDREAL_PLAIN
 
 #endif // POCKETFFT_HDRONLY_H
